@@ -32,7 +32,6 @@ textblob==0.17.1
 nltk==3.8.1
 
 # Database and caching
-sqlite3
 asyncpg==0.29.0
 redis==5.0.1
 
@@ -62,7 +61,6 @@ pytz==2023.3
 
 # Mathematical computations
 sympy==1.12
-statistics
 
 # Social media and news APIs
 tweepy==4.14.0
