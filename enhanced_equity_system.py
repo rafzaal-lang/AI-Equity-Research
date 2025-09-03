@@ -26,7 +26,9 @@ warnings.filterwarnings("ignore")
 # Logging
 # -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("enhanced_equity_system")
+# Quiet down yfinance noise: those "symbol may be delisted" lines
+logging.getLogger("yfinance").setLevel(logging.WARNING)
 
 # -----------------------------------------------------------------------------
 # Config
@@ -69,7 +71,7 @@ class OpenAIProvider(LLMProvider):
     async def generate_response(self, prompt: str, system_prompt: str = "", max_tokens: int = 2000) -> str:
         try:
             resp = await self.client.chat.completions.create(
-                model="gpt-4o-mini",  # adjust if you prefer a different model
+                model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
@@ -236,7 +238,8 @@ class EnhancedDataCollector:
 
         for sector, ticker in sectors.items():
             try:
-                hist = yf.Ticker(ticker).history(period=f"{days}d")
+                # Be explicit on interval; sometimes Yahoo is picky
+                hist = yf.Ticker(ticker).history(period=f"{days}d", interval="1d", auto_adjust=False)
                 if hist.empty:
                     continue
 
@@ -309,14 +312,17 @@ class EnhancedDataCollector:
         return {"put_call_ratio": "N/A", "total_volume": "N/A"}
 
     # ---------------------------- Macro snapshot ------------------------------
-    async def get_economic_indicators(self) -> pd.DataFrame:
+    async def get_economic_indicators(self) -> List[Dict[str, Any]]:
         """
-        Async wrapper so route handlers can 'await' this.
-        Runs the sync computation in a thread.
+        Return JSON-serializable list[dict] so FastAPI can return it directly.
         """
-        return await asyncio.to_thread(self._get_economic_indicators_sync)
+        return await asyncio.to_thread(self._get_econ_json_sync)
 
-    def _get_economic_indicators_sync(self) -> pd.DataFrame:
+    async def get_economic_indicators_df(self) -> pd.DataFrame:
+        """If you need a DataFrame elsewhere."""
+        return await asyncio.to_thread(self._get_econ_df_sync)
+
+    def _get_econ_df_sync(self) -> pd.DataFrame:
         """
         Pull a small macro snapshot from FRED.
         Returns a DataFrame with latest levels and simple deltas.
@@ -327,24 +333,28 @@ class EnhancedDataCollector:
                 columns=["Indicator", "Latest", "Date", "1m_change", "3m_change", "YoY"]
             )
 
+        # Use sturdy, widely-available FRED series
         series = [
             ("Inflation (CPI, Index)", "CPIAUCSL"),
             ("Unemployment Rate (%)", "UNRATE"),
             ("Fed Funds Rate (%)", "FEDFUNDS"),
             ("10Y Treasury Yield (%)", "DGS10"),
-            ("ISM Mfg PMI", "NAPM"),
+            ("Industrial Production (Index)", "INDPRO"),
+            ("Capacity Utilization (%)", "TCU"),
+            ("Housing Starts (Thous, SAAR)", "HOUST"),
         ]
 
         rows = []
         for name, sid in series:
             try:
                 s = self.fred.get_series(sid).dropna()
+                if s.empty:
+                    continue
                 last_date = s.index[-1]
                 last = float(s.iloc[-1])
 
                 def at_months_ago(m: int) -> float:
                     target = last_date - pd.DateOffset(months=m)
-                    # nearest index value in case of business-day calendar
                     idx = s.index.get_indexer([target], method="nearest")[0]
                     return float(s.iloc[idx])
 
@@ -365,6 +375,10 @@ class EnhancedDataCollector:
 
         return pd.DataFrame(rows)
 
+    def _get_econ_json_sync(self) -> List[Dict[str, Any]]:
+        df = self._get_econ_df_sync()
+        return df.to_dict(orient="records")
+
 
 # -----------------------------------------------------------------------------
 # Research System
@@ -377,12 +391,13 @@ class EnhancedEquityResearchSystem:
         self.config = config
         self.llm = llm
         self.collector = EnhancedDataCollector(config)
-        self.data_collector = self.collector  # ← back-compat alias for older route handlers
+        self.data_collector = self.collector  # back-compat alias for older route handlers
 
     async def build_sector_rotation_table(self, days: int = 30) -> pd.DataFrame:
         return await self.collector.get_enhanced_sector_performance(days=days)
 
-    async def get_economic_indicators(self) -> pd.DataFrame:
+    async def get_economic_indicators(self) -> List[Dict[str, Any]]:
+        # Return JSON-friendly data so your FastAPI route can return directly
         return await self.collector.get_economic_indicators()
 
     async def write_research_note(self, df: pd.DataFrame, days: int = 30) -> str:
@@ -420,6 +435,22 @@ Include 2-3 actionable observations and a list of overweight/market-weight/under
 """
 
         return await self.llm.generate_response(user_prompt, system_prompt, max_tokens=1200)
+
+    # ----- WebSocket compatibility: handle chat messages from the UI ----------
+    async def process_chat_query(self, message: str) -> str:
+        """
+        Simple passthrough so your WebSocket route can do:
+            reply = await system.process_chat_query(user_text)
+        """
+        system_prompt = (
+            "You are an equity research copilot. Be concise, numerical when useful, "
+            "and cite the signals we track (momentum, RSI, volume trend, macro context)."
+        )
+        try:
+            return await self.llm.generate_response(message, system_prompt, max_tokens=600)
+        except Exception as e:
+            logger.exception("process_chat_query error")
+            return f"[assistant error] {e}"
 
 
 # -----------------------------------------------------------------------------
@@ -459,11 +490,16 @@ if __name__ == "__main__":
         sys = get_research_system()
         df = await sys.build_sector_rotation_table(days=30)
         print(df.head(5))
-        econ = await sys.get_economic_indicators()
-        print("\n====== ECON SNAPSHOT ======\n")
-        print(econ.to_string(index=False))
+
+        econ_json = await sys.get_economic_indicators()
+        print("\n====== ECON SNAPSHOT (JSON) ======\n")
+        print(json.dumps(econ_json[:5], indent=2))  # first 5 rows only
+
         note = await sys.write_research_note(df, days=30)
         print("\n====== RESEARCH NOTE ======\n")
         print(note)
+
+        reply = await sys.process_chat_query("Which sectors show strongest momentum right now and why?")
+        print("\n====== CHAT REPLY ======\n", reply)
 
     asyncio.run(_demo())
