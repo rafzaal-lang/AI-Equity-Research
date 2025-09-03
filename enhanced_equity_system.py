@@ -1,10 +1,9 @@
 import os
 import asyncio
 import json
-import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
@@ -25,10 +24,11 @@ warnings.filterwarnings("ignore")
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("enhanced_equity_system")
-# Quiet down yfinance noise: those "symbol may be delisted" lines
+logging.basicConfig(level=logging.INFO)
+# Quiet down yfinance noise ("symbol may be delisted" etc.)
 logging.getLogger("yfinance").setLevel(logging.WARNING)
+
 
 # -----------------------------------------------------------------------------
 # Config
@@ -114,7 +114,9 @@ class GrokProvider(LLMProvider):
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         data = {
             "model": "grok-beta",
-            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
+            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}].
+            # in case x.ai changes schema, the fallback error string will make it obvious
+            copy(),
             "temperature": 0.7,
             "max_tokens": max_tokens,
         }
@@ -182,7 +184,7 @@ class PerplexityProvider(LLMProvider):
 
 
 # -----------------------------------------------------------------------------
-# Data collector (prices, options flow, sentiment, macro snapshot)
+# Data collector (prices, options flow, sentiment, macro)
 # -----------------------------------------------------------------------------
 class EnhancedDataCollector:
     def __init__(self, config: APIConfig):
@@ -238,14 +240,14 @@ class EnhancedDataCollector:
 
         for sector, ticker in sectors.items():
             try:
-                # Be explicit on interval; sometimes Yahoo is picky
+                # Explicit interval helps with Yahoo flakiness
                 hist = yf.Ticker(ticker).history(period=f"{days}d", interval="1d", auto_adjust=False)
                 if hist.empty:
                     continue
 
                 current_price = float(hist["Close"].iloc[-1])
                 start_price = float(hist["Close"].iloc[0])
-                performance = (current_price - start_price) / start_price * 100.0
+                performance = (current_price - start_price) / max(start_price, 1e-9) * 100.0
 
                 avg_volume = float(hist["Volume"].mean())
                 recent_volume = float(hist["Volume"].tail(5).mean())
@@ -311,29 +313,102 @@ class EnhancedDataCollector:
             logger.warning(f"Options flow error for {ticker}: {e}")
         return {"put_call_ratio": "N/A", "total_volume": "N/A"}
 
-    # ---------------------------- Macro snapshot ------------------------------
-    async def get_economic_indicators(self) -> List[Dict[str, Any]]:
-        """
-        Return JSON-serializable list[dict] so FastAPI can return it directly.
-        """
-        return await asyncio.to_thread(self._get_econ_json_sync)
+    # ---------------------------- Sentiment -----------------------------------
+    async def get_social_sentiment(self, sector: str) -> Dict[str, Any]:
+        return {
+            "reddit_sentiment": await self._get_reddit_sentiment(sector),
+            "twitter_sentiment": await self._get_twitter_sentiment(sector),
+            "news_sentiment": await self._get_news_sentiment(sector),
+        }
 
-    async def get_economic_indicators_df(self) -> pd.DataFrame:
-        """If you need a DataFrame elsewhere."""
-        return await asyncio.to_thread(self._get_econ_df_sync)
-
-    def _get_econ_df_sync(self) -> pd.DataFrame:
+    async def _get_reddit_sentiment(self, sector: str) -> Dict[str, Any]:
         """
-        Pull a small macro snapshot from FRED.
-        Returns a DataFrame with latest levels and simple deltas.
-        Safe no-op if no FRED key.
+        Lightweight approach via public search JSON (no PRAW).
+        Computes TextBlob sentiment over titles.
+        """
+        try:
+            headers = {"User-Agent": "ai-equity-research/0.1 (contact: dev@example.com)"}
+            params = {"q": f"{sector} stocks", "limit": 25, "sort": "new"}
+            url = "https://www.reddit.com/search.json"
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, headers=headers, params=params, timeout=20) as r:
+                    if r.status != 200:
+                        return {"score": 0.0, "samples": [], "note": f"HTTP {r.status}"}
+                    data = await r.json()
+            titles = [i["data"]["title"] for i in data.get("data", {}).get("children", []) if "data" in i]
+            if not titles:
+                return {"score": 0.0, "samples": []}
+            scores = [TextBlob(t).sentiment.polarity for t in titles]
+            return {"score": float(np.mean(scores)), "samples": titles[:5]}
+        except Exception as e:
+            logger.warning(f"Reddit sentiment error for {sector}: {e}")
+            return {"score": 0.0, "samples": [], "note": str(e)}
+
+    async def _get_twitter_sentiment(self, sector: str) -> Dict[str, Any]:
+        """
+        Uses Twitter v2 Recent Search if TWITTER_BEARER_TOKEN is set; otherwise returns neutral.
+        """
+        if not self.config.twitter_bearer_token:
+            return {"score": 0.0, "samples": [], "note": "No Twitter bearer token set"}
+        try:
+            headers = {"Authorization": f"Bearer {self.config.twitter_bearer_token}"}
+            params = {"query": f'"{sector}" (stocks OR investing) lang:en -is:retweet', "max_results": 25}
+            url = "https://api.twitter.com/2/tweets/search/recent"
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, headers=headers, params=params, timeout=20) as r:
+                    if r.status != 200:
+                        return {"score": 0.0, "samples": [], "note": f"HTTP {r.status}"}
+                    data = await r.json()
+            texts = [t["text"] for t in data.get("data", [])]
+            if not texts:
+                return {"score": 0.0, "samples": []}
+            scores = [TextBlob(t).sentiment.polarity for t in texts]
+            return {"score": float(np.mean(scores)), "samples": texts[:5]}
+        except Exception as e:
+            logger.warning(f"Twitter sentiment error for {sector}: {e}")
+            return {"score": 0.0, "samples": [], "note": str(e)}
+
+    async def _get_news_sentiment(self, sector: str) -> Dict[str, Any]:
+        """
+        Uses NewsAPI.org if NEWS_API_KEY present; otherwise neutral.
+        """
+        if not self.config.news_key:
+            return {"score": 0.0, "samples": [], "note": "No NEWS_API_KEY set"}
+        try:
+            url = "https://newsapi.org/v2/everything"
+            params = {"q": f"{sector} stocks", "language": "en", "pageSize": 25, "apiKey": self.config.news_key}
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, params=params, timeout=20) as r:
+                    if r.status != 200:
+                        return {"score": 0.0, "samples": [], "note": f"HTTP {r.status}"}
+                    data = await r.json()
+            titles = [a["title"] for a in data.get("articles", []) if a.get("title")]
+            if not titles:
+                return {"score": 0.0, "samples": []}
+            scores = [TextBlob(t).sentiment.polarity for t in titles]
+            return {"score": float(np.mean(scores)), "samples": titles[:5]}
+        except Exception as e:
+            logger.warning(f"News sentiment error for {sector}: {e}")
+            return {"score": 0.0, "samples": [], "note": str(e)}
+
+    # ---------------------- Economic indicators (FRED + VIX) ------------------
+    def _fred_series_snapshot(self, sid: str) -> Optional[pd.Series]:
+        if not self.fred:
+            return None
+        try:
+            s = self.fred.get_series(sid)
+            return s.dropna() if s is not None else None
+        except Exception as e:
+            logger.warning(f"FRED series {sid} error: {e}")
+            return None
+
+    def _econ_rows_df(self) -> pd.DataFrame:
+        """
+        Returns a tidy DataFrame of key macro series with latest + deltas.
         """
         if not self.fred:
-            return pd.DataFrame(
-                columns=["Indicator", "Latest", "Date", "1m_change", "3m_change", "YoY"]
-            )
+            return pd.DataFrame(columns=["Indicator", "Latest", "Date", "1m_change", "3m_change", "YoY"])
 
-        # Use sturdy, widely-available FRED series
         series = [
             ("Inflation (CPI, Index)", "CPIAUCSL"),
             ("Unemployment Rate (%)", "UNRATE"),
@@ -344,40 +419,80 @@ class EnhancedDataCollector:
             ("Housing Starts (Thous, SAAR)", "HOUST"),
         ]
 
-        rows = []
+        rows: List[Dict[str, Any]] = []
         for name, sid in series:
-            try:
-                s = self.fred.get_series(sid).dropna()
-                if s.empty:
-                    continue
-                last_date = s.index[-1]
-                last = float(s.iloc[-1])
+            s = self._fred_series_snapshot(sid)
+            if s is None or s.empty:
+                continue
+            last_date = s.index[-1]
+            last = float(s.iloc[-1])
 
-                def at_months_ago(m: int) -> float:
-                    target = last_date - pd.DateOffset(months=m)
-                    idx = s.index.get_indexer([target], method="nearest")[0]
-                    return float(s.iloc[idx])
+            def at_months_ago(m: int) -> float:
+                target = last_date - pd.DateOffset(months=m)
+                idx = s.index.get_indexer([target], method="nearest")[0]
+                return float(s.iloc[idx])
 
-                one_m = at_months_ago(1)
-                three_m = at_months_ago(3)
-                twelve_m = at_months_ago(12)
+            one_m = at_months_ago(1)
+            three_m = at_months_ago(3)
+            twelve_m = at_months_ago(12)
 
-                rows.append({
+            rows.append(
+                {
                     "Indicator": name,
                     "Latest": round(last, 2),
                     "Date": str(pd.to_datetime(last_date).date()),
                     "1m_change": round(last - one_m, 2),
                     "3m_change": round(last - three_m, 2),
                     "YoY": round(last - twelve_m, 2),
-                })
-            except Exception as e:
-                logger.warning(f"FRED series {sid} error: {e}")
+                }
+            )
+
+        # Add VIX from Yahoo as a convenience row
+        try:
+            vix_hist = yf.Ticker("^VIX").history(period="10d", interval="1d")
+            if not vix_hist.empty:
+                vix_last = float(vix_hist["Close"].iloc[-1])
+                vix_prev_m = float(vix_hist["Close"].iloc[0])
+                rows.append(
+                    {
+                        "Indicator": "CBOE Volatility Index (VIX)",
+                        "Latest": round(vix_last, 2),
+                        "Date": str(pd.to_datetime(vix_hist.index[-1]).date()),
+                        "1m_change": round(vix_last - vix_prev_m, 2),
+                        "3m_change": None,
+                        "YoY": None,
+                    }
+                )
+        except Exception as e:
+            logger.warning(f"VIX fetch error: {e}")
 
         return pd.DataFrame(rows)
 
-    def _get_econ_json_sync(self) -> List[Dict[str, Any]]:
-        df = self._get_econ_df_sync()
-        return df.to_dict(orient="records")
+    async def get_economic_indicators(self) -> Dict[str, Any]:
+        """
+        JSON-serializable payload matching the API/FE expectations.
+        Returns:
+          {
+            "list": [ {Indicator, Latest, Date, ...}, ...],
+            "kv": { "Fed_Funds_Rate": float, "10Y_Treasury_Yield": float, "VIX": float }
+          }
+        """
+        df = await asyncio.to_thread(self._econ_rows_df)
+
+        # Build KV map (robust to label changes)
+        kv: Dict[str, float] = {}
+        def try_set(key: str, predicate):
+            try:
+                row = df[df["Indicator"].apply(predicate)].iloc[0]
+                kv[key] = float(row["Latest"])
+            except Exception:
+                pass
+
+        try_set("Fed_Funds_Rate", lambda x: "Fed Funds Rate" in x)
+        try_set("10Y_Treasury_Yield", lambda x: "10Y Treasury Yield" in x or "DGS10" in x)
+        try_set("VIX", lambda x: "VIX" in x)
+
+        return {"list": df.to_dict(orient="records"), "kv": kv}
 
 
 # -----------------------------------------------------------------------------
@@ -391,20 +506,20 @@ class EnhancedEquityResearchSystem:
         self.config = config
         self.llm = llm
         self.collector = EnhancedDataCollector(config)
-        self.data_collector = self.collector  # back-compat alias for older route handlers
+        # Back-compat alias for older code paths
+        self.data_collector = self.collector
 
     async def build_sector_rotation_table(self, days: int = 30) -> pd.DataFrame:
         return await self.collector.get_enhanced_sector_performance(days=days)
 
-    async def get_economic_indicators(self) -> List[Dict[str, Any]]:
-        # Return JSON-friendly data so your FastAPI route can return directly
+    async def get_economic_indicators(self) -> Dict[str, Any]:
         return await self.collector.get_economic_indicators()
 
     async def write_research_note(self, df: pd.DataFrame, days: int = 30) -> str:
         if df is None or df.empty:
             return "No sector data available."
 
-        # Compose sentiment enrichments for the top 3 sectors to keep latency reasonable
+        # Compose sentiment for the top 3 sectors (keeps latency reasonable)
         top = df.head(3)["Sector"].tolist()
         sentiments: Dict[str, Dict[str, Any]] = {}
         for sct in top:
@@ -418,7 +533,6 @@ class EnhancedEquityResearchSystem:
             "Synthesize them into a clear, balanced note with sector overweights/underweights."
         )
 
-        # Build a compact table string
         table = df.to_string(index=False)
         sent_json = json.dumps(sentiments, indent=2)
 
@@ -436,11 +550,9 @@ Include 2-3 actionable observations and a list of overweight/market-weight/under
 
         return await self.llm.generate_response(user_prompt, system_prompt, max_tokens=1200)
 
-    # ----- WebSocket compatibility: handle chat messages from the UI ----------
     async def process_chat_query(self, message: str) -> str:
         """
-        Simple passthrough so your WebSocket route can do:
-            reply = await system.process_chat_query(user_text)
+        Simple passthrough so WebSocket and /api/chat can call it.
         """
         system_prompt = (
             "You are an equity research copilot. Be concise, numerical when useful, "
@@ -451,6 +563,62 @@ Include 2-3 actionable observations and a list of overweight/market-weight/under
         except Exception as e:
             logger.exception("process_chat_query error")
             return f"[assistant error] {e}"
+
+    async def generate_comprehensive_research_report(
+        self,
+        include_sentiment: bool = True,
+        include_options: bool = True,
+        days: int = 30,
+    ) -> Dict[str, Any]:
+        """
+        Produces a full report object:
+        {
+          "report": <string>,
+          "sector_data": <list[dict]>,
+          "economic_data": { "list": [...], "kv": {...} },
+          "metadata": {...}
+        }
+        """
+        # Sector table
+        sector_df = await self.build_sector_rotation_table(days=days)
+
+        # Econ indicators
+        econ = await self.get_economic_indicators()
+
+        # Core note
+        note = await self.write_research_note(sector_df, days=days)
+
+        # Optional: light enrichment text appended to note
+        extra = []
+        if include_sentiment:
+            top = sector_df.head(3)["Sector"].tolist() if not sector_df.empty else []
+            sent_map = {}
+            for s in top:
+                sent_map[s] = await self.collector.get_social_sentiment(s)
+            extra.append(f"\n\nSentiment snapshot (top sectors):\n{json.dumps(sent_map, indent=2)}")
+        if include_options:
+            extra.append("\nOptions flow fields are placeholders (put/call ratio, volume) until Polygon parsing is enabled.")
+
+        report_text = note + "".join(extra)
+
+        metadata = {
+            "generation_time": datetime.utcnow().isoformat() + "Z",
+            "data_sources": {
+                "yf": True,
+                "fred": bool(self.collector.fred is not None),
+                "newsapi": bool(self.collector.config.news_key),
+                "twitter": bool(self.collector.config.twitter_bearer_token),
+                "polygon": bool(self.collector.config.polygon_key),
+            },
+            "window_days": days,
+        }
+
+        return {
+            "report": report_text,
+            "sector_data": sector_df.to_dict(orient="records"),
+            "economic_data": econ,
+            "metadata": metadata,
+        }
 
 
 # -----------------------------------------------------------------------------
@@ -483,23 +651,23 @@ class _EchoProvider(LLMProvider):
 
 
 # -----------------------------------------------------------------------------
-# Local smoke test (won't run on import)
+# Local smoke test
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     async def _demo():
         sys = get_research_system()
         df = await sys.build_sector_rotation_table(days=30)
-        print(df.head(5))
+        print("SECTOR HEAD:\n", df.head(5))
 
-        econ_json = await sys.get_economic_indicators()
-        print("\n====== ECON SNAPSHOT (JSON) ======\n")
-        print(json.dumps(econ_json[:5], indent=2))  # first 5 rows only
+        econ = await sys.get_economic_indicators()
+        print("\n====== ECON SNAPSHOT (JSON-READY) ======\n")
+        print(json.dumps(econ, indent=2)[:2000], "...")
 
         note = await sys.write_research_note(df, days=30)
         print("\n====== RESEARCH NOTE ======\n")
-        print(note)
+        print(note[:2000], "...")
 
-        reply = await sys.process_chat_query("Which sectors show strongest momentum right now and why?")
-        print("\n====== CHAT REPLY ======\n", reply)
+        full = await sys.generate_comprehensive_research_report()
+        print("\n====== REPORT KEYS ======\n", list(full.keys()))
 
     asyncio.run(_demo())
