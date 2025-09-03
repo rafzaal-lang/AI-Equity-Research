@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
-import openai
+from openai import AsyncOpenAI
 from anthropic import Anthropic
 import yfinance as yf
 from fredapi import Fred
@@ -64,7 +64,7 @@ class LLMProvider(ABC):
 
 class OpenAIProvider(LLMProvider):
     def __init__(self, api_key: str):
-        self.client = openai.AsyncOpenAI(api_key=api_key)
+        self.client = AsyncOpenAI(api_key=api_key)
 
     async def generate_response(self, prompt: str, system_prompt: str = "", max_tokens: int = 2000) -> str:
         try:
@@ -180,7 +180,7 @@ class PerplexityProvider(LLMProvider):
 
 
 # -----------------------------------------------------------------------------
-# Data collector (prices, options flow, sentiment)
+# Data collector (prices, options flow, sentiment, macro snapshot)
 # -----------------------------------------------------------------------------
 class EnhancedDataCollector:
     def __init__(self, config: APIConfig):
@@ -308,85 +308,62 @@ class EnhancedDataCollector:
             logger.warning(f"Options flow error for {ticker}: {e}")
         return {"put_call_ratio": "N/A", "total_volume": "N/A"}
 
-    # ---------------------------- Sentiment -----------------------------------
-    async def get_social_sentiment(self, sector: str) -> Dict[str, Any]:
-        return {
-            "reddit_sentiment": await self._get_reddit_sentiment(sector),
-            "twitter_sentiment": await self._get_twitter_sentiment(sector),
-            "news_sentiment": await self._get_news_sentiment(sector),
-        }
+    # ---------------------------- Macro snapshot ------------------------------
+    async def get_economic_indicators(self) -> pd.DataFrame:
+        """
+        Async wrapper so route handlers can 'await' this.
+        Runs the sync computation in a thread.
+        """
+        return await asyncio.to_thread(self._get_economic_indicators_sync)
 
-    async def _get_reddit_sentiment(self, sector: str) -> Dict[str, Any]:
+    def _get_economic_indicators_sync(self) -> pd.DataFrame:
         """
-        Lightweight approach via public search JSON to avoid PRAW creds.
-        Computes TextBlob sentiment over titles.
+        Pull a small macro snapshot from FRED.
+        Returns a DataFrame with latest levels and simple deltas.
+        Safe no-op if no FRED key.
         """
-        try:
-            headers = {"User-Agent": "ai-equity-research/0.1 (contact: dev@example.com)"}
-            params = {"q": f"{sector} stocks", "limit": 25, "sort": "new"}
-            url = "https://www.reddit.com/search.json"
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, headers=headers, params=params, timeout=20) as r:
-                    if r.status != 200:
-                        return {"score": 0.0, "samples": [], "note": f"HTTP {r.status}"}
-                    data = await r.json()
-            titles = [i["data"]["title"] for i in data.get("data", {}).get("children", []) if "data" in i]
-            if not titles:
-                return {"score": 0.0, "samples": []}
-            scores = [TextBlob(t).sentiment.polarity for t in titles]
-            return {"score": float(np.mean(scores)), "samples": titles[:5]}
-        except Exception as e:
-            logger.warning(f"Reddit sentiment error for {sector}: {e}")
-            return {"score": 0.0, "samples": [], "note": str(e)}
+        if not self.fred:
+            return pd.DataFrame(
+                columns=["Indicator", "Latest", "Date", "1m_change", "3m_change", "YoY"]
+            )
 
-    async def _get_twitter_sentiment(self, sector: str) -> Dict[str, Any]:
-        """
-        Uses Twitter v2 Recent Search if TWITTER_BEARER_TOKEN is set; otherwise returns neutral.
-        """
-        if not self.config.twitter_bearer_token:
-            return {"score": 0.0, "samples": [], "note": "No Twitter bearer token set"}
+        series = [
+            ("Inflation (CPI, Index)", "CPIAUCSL"),
+            ("Unemployment Rate (%)", "UNRATE"),
+            ("Fed Funds Rate (%)", "FEDFUNDS"),
+            ("10Y Treasury Yield (%)", "DGS10"),
+            ("ISM Mfg PMI", "NAPM"),
+        ]
 
-        try:
-            headers = {"Authorization": f"Bearer {self.config.twitter_bearer_token}"}
-            params = {"query": f'"{sector}" (stocks OR investing) lang:en -is:retweet', "max_results": 25}
-            url = "https://api.twitter.com/2/tweets/search/recent"
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, headers=headers, params=params, timeout=20) as r:
-                    if r.status != 200:
-                        return {"score": 0.0, "samples": [], "note": f"HTTP {r.status}"}
-                    data = await r.json()
-            texts = [t["text"] for t in data.get("data", [])]
-            if not texts:
-                return {"score": 0.0, "samples": []}
-            scores = [TextBlob(t).sentiment.polarity for t in texts]
-            return {"score": float(np.mean(scores)), "samples": texts[:5]}
-        except Exception as e:
-            logger.warning(f"Twitter sentiment error for {sector}: {e}")
-            return {"score": 0.0, "samples": [], "note": str(e)}
+        rows = []
+        for name, sid in series:
+            try:
+                s = self.fred.get_series(sid).dropna()
+                last_date = s.index[-1]
+                last = float(s.iloc[-1])
 
-    async def _get_news_sentiment(self, sector: str) -> Dict[str, Any]:
-        """
-        Uses NewsAPI.org if NEWS_API_KEY present; otherwise neutral.
-        """
-        if not self.config.news_key:
-            return {"score": 0.0, "samples": [], "note": "No NEWS_API_KEY set"}
+                def at_months_ago(m: int) -> float:
+                    target = last_date - pd.DateOffset(months=m)
+                    # nearest index value in case of business-day calendar
+                    idx = s.index.get_indexer([target], method="nearest")[0]
+                    return float(s.iloc[idx])
 
-        try:
-            url = "https://newsapi.org/v2/everything"
-            params = {"q": f"{sector} stocks", "language": "en", "pageSize": 25, "apiKey": self.config.news_key}
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, params=params, timeout=20) as r:
-                    if r.status != 200:
-                        return {"score": 0.0, "samples": [], "note": f"HTTP {r.status}"}
-                    data = await r.json()
-            titles = [a["title"] for a in data.get("articles", []) if a.get("title")]
-            if not titles:
-                return {"score": 0.0, "samples": []}
-            scores = [TextBlob(t).sentiment.polarity for t in titles]
-            return {"score": float(np.mean(scores)), "samples": titles[:5]}
-        except Exception as e:
-            logger.warning(f"News sentiment error for {sector}: {e}")
-            return {"score": 0.0, "samples": [], "note": str(e)}
+                one_m = at_months_ago(1)
+                three_m = at_months_ago(3)
+                twelve_m = at_months_ago(12)
+
+                rows.append({
+                    "Indicator": name,
+                    "Latest": round(last, 2),
+                    "Date": str(pd.to_datetime(last_date).date()),
+                    "1m_change": round(last - one_m, 2),
+                    "3m_change": round(last - three_m, 2),
+                    "YoY": round(last - twelve_m, 2),
+                })
+            except Exception as e:
+                logger.warning(f"FRED series {sid} error: {e}")
+
+        return pd.DataFrame(rows)
 
 
 # -----------------------------------------------------------------------------
@@ -400,9 +377,13 @@ class EnhancedEquityResearchSystem:
         self.config = config
         self.llm = llm
         self.collector = EnhancedDataCollector(config)
+        self.data_collector = self.collector  # ← back-compat alias for older route handlers
 
     async def build_sector_rotation_table(self, days: int = 30) -> pd.DataFrame:
         return await self.collector.get_enhanced_sector_performance(days=days)
+
+    async def get_economic_indicators(self) -> pd.DataFrame:
+        return await self.collector.get_economic_indicators()
 
     async def write_research_note(self, df: pd.DataFrame, days: int = 30) -> str:
         if df is None or df.empty:
@@ -478,6 +459,9 @@ if __name__ == "__main__":
         sys = get_research_system()
         df = await sys.build_sector_rotation_table(days=30)
         print(df.head(5))
+        econ = await sys.get_economic_indicators()
+        print("\n====== ECON SNAPSHOT ======\n")
+        print(econ.to_string(index=False))
         note = await sys.write_research_note(df, days=30)
         print("\n====== RESEARCH NOTE ======\n")
         print(note)
