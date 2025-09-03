@@ -1,14 +1,13 @@
 services:
-  # Main web service
   - type: web
     name: ai-equity-research
     env: python
     buildCommand: |
-      pip install --upgrade pip &&
+      pip install --upgrade pip
       pip install -r requirements.txt
     startCommand: |
       python main.py
-    plan: starter  # Change to 'standard' or 'pro' for production
+    plan: starter
     healthCheckPath: /health
     envVars:
       - key: ENVIRONMENT
@@ -19,9 +18,8 @@ services:
         value: 1
       - key: PYTHONPATH
         value: /opt/render/project/src
-      # API Keys - These should be set in Render dashboard as environment variables
       - key: OPENAI_KEY
-        sync: false  # Will be set via Render dashboard
+        sync: false
       - key: CLAUDE_KEY
         sync: false
       - key: GROK_KEY
@@ -51,37 +49,28 @@ services:
       mountPath: /opt/render/project/src/data
       sizeGB: 1
 
-  # Background worker service (optional - for scheduled tasks)
   - type: worker
     name: ai-equity-worker
     env: python
     buildCommand: |
-      pip install --upgrade pip &&
+      pip install --upgrade pip
       pip install -r requirements.txt
     startCommand: |
       python -c "
-      import asyncio
-      import schedule
-      import time
-      from enhanced_equity_system import EnhancedEquityResearchSystem, APIConfig
-      
-      def update_market_data():
-          print('Updating market data...')
-          # Add background data update logic here
-          
-      schedule.every(5).minutes.do(update_market_data)
-      
-      while True:
-          schedule.run_pending()
-          time.sleep(1)
-      "
+from enhanced_equity_system import APIConfig, get_research_system
+import schedule, time, asyncio
+async def update():
+    sys = get_research_system()
+    await sys.build_sector_rotation_table(days=30)
+schedule.every(5).minutes.do(lambda: asyncio.run(update()))
+while True:
+    schedule.run_pending()
+    time.sleep(1)
+"
     plan: starter
     envVars:
       - key: ENVIRONMENT
         value: production
-      - key: WORKER_TYPE
-        value: background
-      # Same API keys as web service
       - key: OPENAI_KEY
         sync: false
       - key: FRED_KEY
@@ -91,113 +80,20 @@ services:
       - key: NEWS_API_KEY
         sync: false
 
-  # Redis service for caching (optional)
   - type: redis
     name: ai-equity-cache
     plan: starter
     maxmemoryPolicy: allkeys-lru
 
-  # PostgreSQL database (optional - for persistent storage)
-  # - type: pserv
-  #   name: ai-equity-db
-  #   plan: starter
-  #   databaseName: equity_research
-  #   databaseUser: equity_user
-
-# Environment-specific configurations
-databases:
-  # SQLite is used by default, but you can add PostgreSQL here
-  # - name: ai-equity-postgres
-  #   plan: starter
-
-# Static file serving configuration
 static:
   - publicPath: /static
     dir: static
-  - publicPath: /templates  
+  - publicPath: /templates
     dir: templates
 
-# Domain configuration (set up custom domain in Render dashboard)
-domains:
-  # - name: your-domain.com
-  # - name: www.your-domain.com
-
-# Build configuration
-build:
-  commands:
-    - echo "Installing system dependencies..."
-    - apt-get update && apt-get install -y curl git
-    - echo "Installing Python dependencies..."
-    - pip install --upgrade pip
-    - pip install -r requirements.txt
-    - echo "Setting up directories..."
-    - mkdir -p templates static reports logs data
-    - echo "Build completed successfully"
-
-# Health check configuration
 healthCheck:
   path: /health
   interval: 30s
   timeout: 10s
   failureThreshold: 3
   successThreshold: 1
-
-# Scaling configuration
-scaling:
-  minInstances: 1
-  maxInstances: 3
-  targetCPU: 70
-  targetMemory: 80
-
-# Logging configuration
-logging:
-  level: INFO
-  format: json
-
-# Security headers
-headers:
-  - name: X-Content-Type-Options
-    value: nosniff
-  - name: X-Frame-Options
-    value: DENY
-  - name: X-XSS-Protection
-    value: "1; mode=block"
-  - name: Referrer-Policy
-    value: strict-origin-when-cross-origin
-  - name: Content-Security-Policy
-    value: "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' wss: https:"
-
-# Redirect configuration
-redirects:
-  - source: /
-    destination: /
-    permanent: false
-
-# Custom build hooks
-hooks:
-  preBuild: |
-    echo "Pre-build: Setting up environment"
-    export NODE_ENV=production
-  postBuild: |
-    echo "Post-build: Cleaning up temporary files"
-    find . -name "*.pyc" -delete
-    find . -name "__pycache__" -type d -delete
-
-# Monitoring and alerting
-monitoring:
-  enabled: true
-  alerts:
-    - type: cpu
-      threshold: 80
-    - type: memory
-      threshold: 85
-    - type: response_time
-      threshold: 2000  # milliseconds
-    - type: error_rate
-      threshold: 5  # percentage
-
-# Backup configuration
-backup:
-  enabled: true
-  schedule: "0 2 * * *"  # Daily at 2 AM
-  retention: 7  # days
