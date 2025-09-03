@@ -1,74 +1,122 @@
-# scripts/setup.sh
-#!/bin/bash
-
+#!/usr/bin/env bash
 # Setup script for AI Equity Research Platform
 
-set -e
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
 
 echo "🔧 Setting up AI Equity Research Platform..."
 
-# Check Python version
-python_version=$(python3 --version | cut -d' ' -f2)
-required_version="3.11"
-
-if [[ "$python_version" < "$required_version" ]]; then
-    echo "❌ Python 3.11+ required. Found: $python_version"
-    exit 1
+# --------------------------------------------------------------------
+# Python detection
+# --------------------------------------------------------------------
+if command -v python3 >/dev/null 2>&1; then
+  PY=python3
+elif command -v python >/dev/null 2>&1; then
+  PY=python
+else
+  echo "❌ Python not found. Install Python 3.11+."
+  exit 1
 fi
 
-echo "✅ Python version check passed: $python_version"
+PY_VER="$($PY - <<'PYCODE'
+import sys
+print(".".join(map(str, sys.version_info[:3])))
+PYCODE
+)"
 
-# Create virtual environment
-if [ ! -d "venv" ]; then
-    echo "📦 Creating virtual environment..."
-    python3 -m venv venv
+REQ_MAJOR=3
+REQ_MINOR=11
+MAJOR="${PY_VER%%.*}"
+MINOR="$(python - <<'PYCODE'
+import sys
+v=sys.version_info
+print(v.minor)
+PYCODE
+)"
+
+if (( MAJOR < REQ_MAJOR )) || { (( MAJOR == REQ_MAJOR )) && (( MINOR < REQ_MINOR )); }; then
+  echo "❌ Python 3.11+ required. Found: $PY_VER"
+  exit 1
+fi
+echo "✅ Python version check passed: $PY_VER"
+
+# --------------------------------------------------------------------
+# Virtual environment
+# --------------------------------------------------------------------
+if [[ ! -d "venv" ]]; then
+  echo "📦 Creating virtual environment..."
+  $PY -m venv venv
 fi
 
-# Activate virtual environment
+# shellcheck disable=SC1091
 source venv/bin/activate
-echo "✅ Virtual environment activated"
+echo "✅ Virtual environment activated (venv)"
 
-# Upgrade pip
-pip install --upgrade pip
+# --------------------------------------------------------------------
+# Dependencies
+# --------------------------------------------------------------------
+python -m pip install --upgrade pip
 echo "✅ Pip upgraded"
 
-# Install dependencies
 echo "📚 Installing dependencies..."
 pip install -r requirements.txt
 echo "✅ Dependencies installed"
 
-# Create directories
+# --------------------------------------------------------------------
+# Project directories
+# --------------------------------------------------------------------
 mkdir -p templates static reports logs data
 echo "✅ Created required directories"
 
-# Copy template files if they don't exist
-if [ ! -f ".env" ]; then
-    if [ -f ".env.template" ]; then
-        cp .env.template .env
-        echo "✅ Created .env from template"
-        echo "⚠️  Please edit .env and add your API keys"
-    else
-        echo "⚠️  Please create .env file with your API keys"
-    fi
+# --------------------------------------------------------------------
+# Env file
+# --------------------------------------------------------------------
+if [[ ! -f ".env" ]]; then
+  if [[ -f ".env.example" ]]; then
+    cp .env.example .env
+    echo "✅ Created .env from .env.example"
+    echo "⚠️  Please edit .env and add your API keys"
+  elif [[ -f ".env.template" ]]; then
+    cp .env.template .env
+    echo "✅ Created .env from .env.template"
+    echo "⚠️  Please edit .env and add your API keys"
+  else
+    echo "⚠️  Please create a .env file with your API keys (see .env.example)"
+  fi
 fi
 
-# Download NLTK data (for sentiment analysis)
-python3 -c "
-import nltk
+# --------------------------------------------------------------------
+# NLTK/TextBlob data (best-effort)
+# --------------------------------------------------------------------
+python - <<'PYCODE'
 try:
-    nltk.download('punkt', quiet=True)
-    nltk.download('vader_lexicon', quiet=True)
-    print('✅ NLTK data downloaded')
-except:
-    print('⚠️  Could not download NLTK data')
-"
+    import nltk
+    for pkg in ["punkt","vader_lexicon","wordnet","omw-1.4"]:
+        try:
+            nltk.download(pkg, quiet=True)
+        except Exception:
+            pass
+    print("✅ NLTK data downloaded (best-effort)")
+except Exception:
+    print("ℹ️  NLTK not available; skipping corpus download")
 
+try:
+    import textblob
+    from textblob import download_corpora
+    download_corpora.download_all()
+    print("✅ TextBlob corpora downloaded (best-effort)")
+except Exception:
+    print("ℹ️  TextBlob corpora not downloaded; continuing")
+PYCODE
+
+echo ""
 echo "🎉 Setup completed successfully!"
 echo ""
 echo "Next steps:"
-echo "1. Edit .env file with your API keys"
-echo "2. Copy HTML content to templates/index.html"
-echo "3. Copy JavaScript content to static/app.js"
-echo "4. Run: python main.py"
+echo "1) Edit .env and add your API keys"
+echo "2) Put your UI HTML in templates/index.html (or keep the default)"
+echo "3) Start the server:  source venv/bin/activate && python main.py"
 echo ""
 echo "🚀 Ready to launch!"
